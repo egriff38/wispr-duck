@@ -38,6 +38,8 @@ final class ProcessTapManager {
     private let listenerQueue = DispatchQueue(label: "com.wisprduck.processmonitor", qos: .userInitiated)
     private var isDucking = false
     private var currentDuckLevel: Float = 1.0
+    private var blurCutoff: Float = 1500
+    private var blurMix: Float = 1
     private var currentBundleIDs: Set<String> = []
     private var duckAllMode = false
     private var fadeOutTimer: DispatchWorkItem?
@@ -246,6 +248,7 @@ final class ProcessTapManager {
             let shouldDuck = duckAll || processMatchesSelection(process, selectedBundleIDs: bundleIDs)
             if shouldDuck {
                 tap.updateDuckLevel(duckLevel)
+                tap.updateFilter(cutoff: blurCutoff, mix: blurMix)
             } else {
                 tap.stop()
                 activeTaps.removeValue(forKey: pid)
@@ -263,7 +266,7 @@ final class ProcessTapManager {
                 processObjectID: process.objectID,
                 pid: process.pid
             )
-            if tap.start(outputDeviceUID: outputDeviceUID, duckLevel: duckLevel) {
+            if tap.start(outputDeviceUID: outputDeviceUID, duckLevel: duckLevel, cutoff: blurCutoff, blurMix: blurMix) {
                 activeTaps[process.pid] = tap
             } else {
                 reportError(
@@ -311,11 +314,11 @@ final class ProcessTapManager {
         // currentDuckLevel→1.0 takes (1 - currentDuckLevel) * 1.0 seconds.
         // Wait for the ramp to finish before tearing down taps, with a small scheduling cushion.
         let rampDuration: Double = 1.0
-        let estimatedFadeTime = max(0.05, Double(1.0 - currentDuckLevel) * rampDuration + 0.05)
+        let estimatedFadeTime = max(0.20, Double(1.0 - currentDuckLevel) * rampDuration + 0.05)
 
         // Ramp all taps toward full volume
         for tap in activeTaps.values {
-            tap.updateDuckLevel(1.0)
+            tap.restoreNormal()
         }
 
         // Schedule tap destruction just after the linear ramp completes.
@@ -339,6 +342,14 @@ final class ProcessTapManager {
         currentDuckLevel = level
         for tap in activeTaps.values {
             tap.updateDuckLevel(level)
+        }
+    }
+
+    func updateFilter(cutoff: Float, mix: Float) {
+        blurCutoff = cutoff
+        blurMix = mix
+        for tap in activeTaps.values where isDucking {
+            tap.updateFilter(cutoff: cutoff, mix: mix)
         }
     }
 
@@ -480,7 +491,7 @@ final class ProcessTapManager {
                 processObjectID: process.objectID,
                 pid: process.pid
             )
-            if tap.start(outputDeviceUID: outputUID, duckLevel: currentDuckLevel) {
+            if tap.start(outputDeviceUID: outputUID, duckLevel: currentDuckLevel, cutoff: blurCutoff, blurMix: blurMix) {
                 activeTaps[process.pid] = tap
             } else {
                 reportError(

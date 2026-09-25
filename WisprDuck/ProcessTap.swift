@@ -27,6 +27,16 @@ final class ProcessTap {
     private var targetLevel: Float = 1.0
     private var currentLevel: Float = 1.0
     private var rampRate: Float = 0.0 // Max change per sample (linear ramp)
+    // One filter history per output channel, allocated before audio I/O starts.
+    private var lowPassA: [Float] = []
+    private var lowPassB: [Float] = []
+    private var lowPassCoefficient: Float = 1
+    private var filterMix: Float = 0
+    private var targetFilterMix: Float = 1
+    private var filterMixRate: Float = 1
+    private var sampleRate: Float = 44100
+    private var targetLowPassCoefficient: Float = 1
+    private var coefficientStep: Float = 0
 
     init(processObjectID: AudioObjectID, pid: pid_t) {
         self.processObjectID = processObjectID
@@ -43,13 +53,14 @@ final class ProcessTap {
     /// - Parameters:
     ///   - outputDeviceUID: UID of the output device to route audio through
     ///   - duckLevel: Volume factor 0.0–1.0 (e.g., 0.2 for 20%)
-    func start(outputDeviceUID: String, duckLevel: Float) -> Bool {
+    func start(outputDeviceUID: String, duckLevel: Float, cutoff: Float, blurMix: Float) -> Bool {
         guard !isRunning else { return true }
         lastError = nil
 
         let clampedLevel = max(0.0, min(1.0, duckLevel))
         targetLevel = clampedLevel
         currentLevel = clampedLevel // Start at duck level — no ramp on duck-in to avoid silence→pop
+        targetFilterMix = max(0, min(1, blurMix))
 
         // 1. Create tap description
         let tapDesc = CATapDescription(stereoMixdownOfProcesses: [processObjectID])
@@ -69,6 +80,8 @@ final class ProcessTap {
 
         // 3. Compute linear ramp rate from tap's sample rate
         rampRate = computeRampRate(tapID: tapID)
+        lowPassCoefficient = 1 - exp(-2 * .pi * max(300, min(6000, cutoff)) / sampleRate)
+        targetLowPassCoefficient = lowPassCoefficient
 
         // 4. Create aggregate device combining real output + tap
         let aggDesc: [String: Any] = [
@@ -98,6 +111,13 @@ final class ProcessTap {
             let message = "Could not create aggregate audio device for PID \(pid): \(describeOSStatus(status))"
             lastError = message
             logger.error("\(message)")
+            cleanupTap()
+            return false
+        }
+
+        guard prepareOutputChannels() else {
+            lastError = "Could not read aggregate device output channels for PID \(pid)"
+            cleanupAggregateDevice()
             cleanupTap()
             return false
         }
@@ -152,18 +172,34 @@ final class ProcessTap {
         cleanupTap()
     }
 
-    /// Update the duck level while the tap is running.
+    /// Update gain independently of EQ (100% gain can still be blurred).
     func updateDuckLevel(_ level: Float) {
         let clampedLevel = max(0.0, min(1.0, level))
+        ioQueue.async { [weak self] in self?.targetLevel = clampedLevel }
+    }
+
+    func updateFilter(cutoff: Float, mix: Float) {
         ioQueue.async { [weak self] in
-            self?.targetLevel = clampedLevel
+            guard let self else { return }
+            let frequency = max(300, min(6000, cutoff))
+            self.targetLowPassCoefficient = 1 - exp(-2 * .pi * frequency / self.sampleRate)
+            self.coefficientStep = (self.targetLowPassCoefficient - self.lowPassCoefficient) / (self.sampleRate * 0.15)
+            self.targetFilterMix = max(0, min(1, mix))
+        }
+    }
+
+    func restoreNormal() {
+        ioQueue.async { [weak self] in
+            self?.targetLevel = 1
+            self?.targetFilterMix = 0
         }
     }
 
     // MARK: - Audio Processing
 
-    /// Called on the IO queue for each audio buffer. Scales input samples by the
-    /// duck level with a linear ramp for smooth, constant-rate volume transitions.
+    /// Scales and low-pass filters Float32 stereo samples. Each channel keeps
+    /// independent filter history across callbacks; the dry/wet mix ramps to
+    /// avoid a treble jump when the tap starts or stops.
     ///
     /// The aggregate device's input buffer layout is:
     ///   [output device's input buffers...] [tap's input buffers...]
@@ -199,9 +235,18 @@ final class ProcessTap {
         }
 
         let target = targetLevel
-        var current = currentLevel
+        let startingLevel = currentLevel
+        var endingLevel = startingLevel
+        let filterStep = filterMixRate
+        let targetMix = targetFilterMix
+        let startingMix = filterMix
+        var endingMix = startingMix
         let rate = rampRate
+        let targetAlpha = targetLowPassCoefficient
+        let alphaStep = coefficientStep
+        var endingAlpha = lowPassCoefficient
 
+        var channelBase = 0
         for (i, output) in outputs.enumerated() {
             let inputIndex = tapOffset + i
             guard inputIndex < inputs.count,
@@ -218,16 +263,43 @@ final class ProcessTap {
             let byteCount = min(Int(inputs[inputIndex].mDataByteSize), Int(output.mDataByteSize))
             let sampleCount = byteCount / MemoryLayout<Float>.size
 
-            for j in 0..<sampleCount {
-                // Linear ramp: move toward target at a fixed rate per sample.
-                // A full 0→1 sweep takes exactly 1 second. Partial sweeps are proportional.
-                let delta = target - current
-                current += max(-rate, min(rate, delta))
-                outSamples[j] = inSamples[j] * current
+            let channels = Int(output.mNumberChannels)
+            guard channels > 0 else {
+                memset(outData, 0, Int(output.mDataByteSize))
+                continue
             }
+            let base = channelBase
+            channelBase += channels
+            let frames = sampleCount / channels
+            var current = startingLevel
+            var filterAlpha = lowPassCoefficient
+            var mix = startingMix
+            for frame in 0..<frames {
+                current += max(-rate, min(rate, target - current))
+                filterAlpha += max(-abs(alphaStep), min(abs(alphaStep), targetAlpha - filterAlpha))
+                mix += max(-filterStep, min(filterStep, targetMix - mix))
+                for channel in 0..<channels {
+                    let index = frame * channels + channel
+                    let stateIndex = base + channel
+                    let dry = inSamples[index]
+                    if stateIndex < lowPassA.count {
+                        lowPassA[stateIndex] += filterAlpha * (dry - lowPassA[stateIndex])
+                        lowPassB[stateIndex] += filterAlpha * (lowPassA[stateIndex] - lowPassB[stateIndex])
+                        outSamples[index] = (dry + mix * (lowPassB[stateIndex] - dry)) * current
+                    } else {
+                        // A device layout changed without a restart: still duck, never leak full-volume audio.
+                        outSamples[index] = dry * current
+                    }
+                }
+            }
+            endingLevel = current
+            endingAlpha = filterAlpha
+            endingMix = mix
         }
 
-        currentLevel = current
+        currentLevel = endingLevel
+        filterMix = endingMix
+        lowPassCoefficient = endingAlpha
     }
 
     // MARK: - Cleanup Helpers
@@ -261,6 +333,31 @@ final class ProcessTap {
 
     // MARK: - Helpers
 
+    /// Query the aggregate's output layout once, before starting real-time I/O.
+    private func prepareOutputChannels() -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(aggregateDeviceID, &address, 0, nil, &size) == noErr,
+              size >= MemoryLayout<AudioBufferList>.size else { return false }
+        let storage = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { storage.deallocate() }
+        guard AudioObjectGetPropertyData(aggregateDeviceID, &address, 0, nil, &size, storage) == noErr else {
+            return false
+        }
+        let buffers = UnsafeMutableAudioBufferListPointer(storage.assumingMemoryBound(to: AudioBufferList.self))
+        let channels = buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
+        guard channels > 0 else { return false }
+        lowPassA = [Float](repeating: 0, count: channels)
+        lowPassB = [Float](repeating: 0, count: channels)
+        return true
+    }
+
     /// Compute the linear ramp rate (max volume change per sample) for 1-second transitions.
     /// At 48kHz: rate = 1/48000 ≈ 0.00002. A full 0→1 sweep takes exactly 1s.
     /// Partial sweeps are proportional (e.g., 0.1→1.0 takes 0.9s).
@@ -278,9 +375,10 @@ final class ProcessTap {
             && format.mFormatID == kAudioFormatLinearPCM
             && (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0
             && format.mBitsPerChannel == 32
-        let sampleRate: Float = (status == noErr && format.mSampleRate > 0)
+        sampleRate = (status == noErr && format.mSampleRate > 0)
             ? Float(format.mSampleRate)
-            : 44100.0 // Fallback
+            : 44100
+        filterMixRate = 1 / (sampleRate * 0.15)
 
         let rampDuration: Float = 1.0 // Full 0→1 sweep in 1 second
         return 1.0 / (sampleRate * rampDuration)

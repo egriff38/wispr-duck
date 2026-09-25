@@ -17,6 +17,12 @@ final class AppSettings {
     var duckLevel: Int = UserDefaults.standard.object(forKey: "duckLevel") as? Int ?? 10 {
         didSet { UserDefaults.standard.set(duckLevel, forKey: "duckLevel"); onSettingsChanged?() }
     }
+    var blurCutoff: Int = UserDefaults.standard.object(forKey: "blurCutoff") as? Int ?? 1500 {
+        didSet { UserDefaults.standard.set(blurCutoff, forKey: "blurCutoff"); onSettingsChanged?() }
+    }
+    var blurMix: Int = UserDefaults.standard.object(forKey: "blurMix") as? Int ?? 100 {
+        didSet { UserDefaults.standard.set(blurMix, forKey: "blurMix"); onSettingsChanged?() }
+    }
     var duckAllApps: Bool = UserDefaults.standard.object(forKey: "duckAllApps") as? Bool ?? false {
         didSet { UserDefaults.standard.set(duckAllApps, forKey: "duckAllApps"); onSettingsChanged?() }
     }

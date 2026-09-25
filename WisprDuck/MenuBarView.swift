@@ -61,6 +61,28 @@ struct MenuBarView: View {
                 )
             }
 
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Blur Cutoff: \(settings.blurCutoff) Hz")
+                    .font(.subheadline)
+                Slider(value: Binding(
+                    get: { Double(settings.blurCutoff) },
+                    set: { settings.blurCutoff = Int($0) }
+                ), in: 300...6000, step: 100)
+
+                Text("Blur Mix: \(settings.blurMix)%")
+                    .font(.subheadline)
+                Slider(value: Binding(
+                    get: { Double(settings.blurMix) },
+                    set: { settings.blurMix = Int($0) }
+                ), in: 0...100, step: 5)
+
+                Toggle("Preview Ducking", isOn: Binding(
+                    get: { duckController.isPreviewing },
+                    set: { duckController.setPreviewing($0) }
+                ))
+                .disabled(!settings.isEnabled)
+            }
+
             Divider()
 
             // Trigger source

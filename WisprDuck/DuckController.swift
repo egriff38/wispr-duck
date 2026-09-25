@@ -3,6 +3,7 @@ import Combine
 
 final class DuckController: ObservableObject {
     @Published private(set) var isDucked: Bool = false
+    @Published private(set) var isPreviewing: Bool = false
     @Published private(set) var audioApps: [AudioApp] = []
     @Published private(set) var triggerEligibleApps: [AudioApp] = []
     @Published private(set) var audioStatusMessage: String?
@@ -14,6 +15,7 @@ final class DuckController: ObservableObject {
 
     init(settings: AppSettings) {
         self.settings = settings
+        tapManager.updateFilter(cutoff: Float(settings.blurCutoff), mix: Float(settings.blurMix) / 100)
 
         // Wire the root bundle ID resolver so MicMonitor can resolve helper bundle IDs
         micMonitor.rootBundleIDResolver = { [weak self] bundleID in
@@ -67,12 +69,13 @@ final class DuckController: ObservableObject {
                 self.syncTriggerSettings()
 
                 guard self.settings.isEnabled else {
+                    self.isPreviewing = false
                     self.restoreAndStop()
                     return
                 }
 
                 if self.isDucked {
-                    if self.micMonitor.shouldTriggerDuck {
+                    if self.micMonitor.shouldTriggerDuck || self.isPreviewing {
                         self.isDucked = self.tapManager.reconcileActiveTaps(
                             bundleIDs: self.settings.enabledBundleIDs,
                             duckAll: self.settings.duckAllApps,
@@ -82,6 +85,7 @@ final class DuckController: ObservableObject {
                         self.restore()
                     }
                 }
+                self.tapManager.updateFilter(cutoff: Float(self.settings.blurCutoff), mix: Float(self.settings.blurMix) / 100)
                 self.micMonitor.refreshTriggerState()
             }
         }
@@ -99,18 +103,22 @@ final class DuckController: ObservableObject {
     private func handleTriggerStateChange(shouldDuck: Bool) {
         guard settings.isEnabled else { return }
 
-        if shouldDuck {
+        if shouldDuck || isPreviewing {
             startTriggerReevaluationTimer()
             if !isDucked {
                 duck()
             }
+        } else if isDucked {
+            restore()
         } else {
-            if isDucked {
-                restore()
-            } else {
-                stopTriggerReevaluationTimer()
-            }
+            stopTriggerReevaluationTimer()
         }
+    }
+
+    func setPreviewing(_ previewing: Bool) {
+        guard settings.isEnabled || !previewing else { return }
+        isPreviewing = previewing
+        handleTriggerStateChange(shouldDuck: micMonitor.shouldTriggerDuck)
     }
 
     private func duck() {
@@ -177,7 +185,7 @@ final class DuckController: ObservableObject {
     private func refreshWhileTriggered() {
         micMonitor.refreshTriggerState()
 
-        guard settings.isEnabled, micMonitor.shouldTriggerDuck else { return }
+        guard settings.isEnabled, micMonitor.shouldTriggerDuck || isPreviewing else { return }
 
         let hasTaps = tapManager.reconcileActiveTaps(
             bundleIDs: settings.enabledBundleIDs,
